@@ -1,190 +1,141 @@
-# Nous Portal OAuth
+# @magpie-community/opencode-nous-auth
 
-An **experimental** OpenCode provider plugin for a Nous Portal account, with
-independent device-code sign-in and automatic token renewal. It does not need
-Hermes Agent or a running Hermes subscription proxy.
+Signs in to [Nous Portal](https://portal.nousresearch.com) with its OAuth
+Device Authorization flow and sends model requests in
+[magpie](https://usemagpie.ai) and [OpenCode](https://opencode.ai). Provider id:
+`nous-portal`. This is separate from magpie's `nous` API-key preset.
 
-Package: `@magpie-community/opencode-nous-auth`. Provider id: `nous-portal`.
-This is separate from magpie's **Nous Portal API-key preset** (`nous`): it does
-not replace that preset, import its keys, or change its requests. It addresses
-the OAuth portion of [magpie#392](https://github.com/yetone/magpie/issues/392),
-not the independent API-key validation still discussed there.
+**Experimental.** The plugin uses the public `hermes-cli` OAuth client id from
+Hermes Agent; Nous has not confirmed its use by independent clients. Device
+sign-in and live model discovery have been tried with a real account in magpie.
+Inference requests, token renewal after expiry, and OpenCode have not yet been
+verified with a real account.
 
-**Verification status:** the offline tests exercise the public hooks and the
-wire contract read from Hermes's source. A real Nous account, the vendor's
-acceptance of this third-party use of its public client id, a running magpie,
-and OpenCode have not been tested. Do not treat a passing offline test as proof
-of subscription entitlement or a successful production login.
+## Signing in
 
-## Try the checkout
-
-From this repository, with a magpie binary installed:
-
-```sh
-MAGPIE=/absolute/path/to/magpie sh scripts/try.sh nous
-MAGPIE=/absolute/path/to/magpie sh scripts/try.sh nous login nous-portal
-MAGPIE=/absolute/path/to/magpie sh scripts/try.sh nous provider test nous-portal
-```
-
-`try.sh` installs `packages/nous` under `.sandbox/nous` with isolated HOME,
-USERPROFILE and XDG directories. It leaves the real gateway, agent configuration
-and sign-ins alone. Do not use a portable Windows magpie executable here: it
-ignores those home overrides. The last command sends real requests and can
-consume the account's allowance.
-
-Once this package has been reviewed and published, installation is:
+Once the package is available from magpie's plugin registry:
 
 ```sh
 magpie plugin add @magpie-community/opencode-nous-auth
 magpie plugin login nous-portal
 ```
 
-Or add `"@magpie-community/opencode-nous-auth"` to OpenCode's `plugin` array and
-run `opencode auth login`. Publication and successful use in OpenCode are not
-claimed by this change.
+Magpie displays a verification URL and a code. Open the page, sign in and
+approve the code there; finish any CAPTCHA in your browser. The plugin polls
+for approval and completes sign-in without a local callback server.
+Hermes Agent does not need to be installed or running.
 
-Approve the displayed device code in the Portal browser page. Finish login,
-consent and any CAPTCHA yourself in that browser. The callback polls until
-approval, denial or expiry; no local callback listener or browser automation
-is started. An account's models and billing remain decisions of Nous Portal.
-This plugin does not implement or promise a separate “Sign in with ChatGPT”
-flow; any identity options on the Portal page are provided by the Portal.
+In OpenCode, add `"@magpie-community/opencode-nous-auth"` to the `plugin`
+array in `opencode.json`, then run `opencode auth login`.
 
-## Protocol and ownership
+The flow uses Nous Portal's `/api/oauth/device/code` and `/api/oauth/token`
+with public client `hermes-cli`, scope `inference:invoke`, and no client
+secret. Device polling follows [RFC 8628](https://www.rfc-editor.org/rfc/rfc8628.html#section-3.5),
+including the server's interval and `slow_down` responses. The Portal decides which sign-in methods and models an
+account can use; the plugin does not implement a separate ChatGPT sign-in.
 
-The protocol constants and request shapes come from Hermes Agent's
-[`auth_constants.py`](https://github.com/NousResearch/hermes-agent/blob/8b9ac5773ea07189f23aa9dfcdba1e59fd759c21/hermes_cli/auth_constants.py),
-[`auth_device_flow.py`](https://github.com/NousResearch/hermes-agent/blob/8b9ac5773ea07189f23aa9dfcdba1e59fd759c21/hermes_cli/auth_device_flow.py),
-[`auth_nous.py`](https://github.com/NousResearch/hermes-agent/blob/8b9ac5773ea07189f23aa9dfcdba1e59fd759c21/hermes_cli/auth_nous.py)
-and its
-[`NousPortalAdapter`](https://github.com/NousResearch/hermes-agent/blob/8b9ac5773ea07189f23aa9dfcdba1e59fd759c21/hermes_cli/proxy/adapters/nous_portal.py).
+## Where the sign-in is kept
 
-- Device authorization posts a form to
-  `https://portal.nousresearch.com/api/oauth/device/code`, with public client
-  `hermes-cli` and only `inference:invoke`. Token polling uses
-  `/api/oauth/token` and the RFC 8628 device-code grant. There is no client
-  secret. A separate registered magpie client has not been verified; vendor
-  approval or a replacement registered client is a review prerequisite, not
-  an invented identifier in this implementation.
-- Renewal posts `grant_type=refresh_token` and `client_id=hermes-cli` to the
-  same token endpoint. The refresh token goes in **`x-nous-refresh-token`**,
-  not in the form or the inference request. The inference access token is a
-  Bearer JWT with `inference:invoke`; there is no legacy agent-key exchange,
-  anonymous-account mint, billing permission or automatic account import.
-- Device polling respects the server's minimum interval (five seconds when
-  absent) and adds five seconds for `slow_down`, as
-  [RFC 8628 section 3.5](https://www.rfc-editor.org/rfc/rfc8628.html#section-3.5)
-  specifies. This deliberately does not copy Hermes's one-second polling cap.
-  Transport failures, rate limits and edge challenges back off, respecting
-  `Retry-After`. A monotonic deadline begins at code issuance and ends no later
-  than the server's expiry or thirty minutes locally. OAuth requests also
-  have individual timeouts and never follow redirects.
+Magpie keeps the account in its plugin credential store; OpenCode uses its own
+sign-in store. The saved OAuth fields are `access` (inference JWT), `expires`
+(epoch milliseconds) and `refresh` (versioned JSON containing the refresh
+token, scope, token type and inference endpoint). **The entire `refresh` value
+is secret**, even though it looks like JSON.
 
-### Where the sign-in is kept
+Nothing is read from or written to `~/.hermes/auth.json`. A separate device
+sign-in is intentional: Nous refresh tokens are single-use, and copying one
+from Hermes could invalidate Hermes's session when either program renews it.
 
-The host owns its credential store; this package never reads or writes another
-application's files. `auth.refresh` returns changed fields for magpie to save
-with its account identity guard. OpenCode's per-request fallback saves through
-`client.auth.set`, scoped by the host to the provider/account.
+Magpie uses `auth.refresh` with a two-minute lead and saves the rotated
+tokens. OpenCode does not call that hook, so the plugin also checks before
+each request and persists renewals through `client.auth.set`. Concurrent
+refreshes within one plugin instance share one exchange. A rotated pair is
+kept in memory before a save is attempted, so a failed save does not cause
+that instance to reuse the old refresh token.
 
-The stored shape is the standard `type: "oauth"`, `access`, `refresh`, `expires`.
-`access` is the inference JWT. `expires` is epoch milliseconds, conservatively
-the earlier of the token response's lifetime and the JWT's expiry when both
-exist. `refresh` is a versioned JSON string holding the raw refresh token,
-granted scope, token type and allowlisted inference base. Keeping metadata
-inside this standard field also works with stores that discard extra fields.
-**The whole refresh field is a secret**, not a configuration value to paste
-into a report. No token is logged, and vendor error bodies/descriptions are
-not copied into authentication errors. JWT decoding checks shape, scope and
-expiry only; it does not verify a signature. The inference server does that.
+**Do not run multiple hosts against the same saved account.** The per-request
+save is not an atomic cross-process operation; a crash during an unsaved
+rotation may require signing in again. Explicit revoked-grant errors require
+re-authentication, while temporary service or edge failures keep the sign-in.
 
-Magpie's `auth.refreshLead` and the request fallback both renew two minutes
-early. Concurrent renewals within one plugin instance share an exchange. A
-rotated pair is kept in memory before validation or persistence; a failed save
-is retried as a save rather than by spending its predecessor again. An
-unusable successor is not sent to inference, but the host can retain its new
-refresh token for recovery. A transient early-refresh outage can use the old
-JWT only while it is still valid. Explicit dead-grant errors mark the sign-in
-expired; an edge challenge, timeout, rate limit or server outage does not.
+## Requests
 
-Magpie's scheduled refresh saves with the host's atomic identity check. The
-request fallback re-reads the account before saving, retaining current
-metadata and avoiding a new login it can observe. OpenCode's `auth.set` has no
-compare-and-swap API: that fallback is an optimistic guard, **not an atomic
-cross-process transaction**. Use one running host as owner of a token family.
-Do not share this sign-in between processes or copy it into Hermes. Likewise,
-do not copy Hermes's single-use refresh token into this plugin: independently
-redeeming it can revoke Hermes's session. If an exchange succeeded remotely
-but its response was lost, recovery may require a new login; no exactly-once
-network guarantee is claimed. Memory-only successors cannot survive a crash
-when their host save has failed.
+Models use OpenAI Chat Completions (`@ai-sdk/openai-compatible`) at
+`https://inference-api.nousresearch.com/v1`. Magpie translates requests from
+other agent protocols. Every request uses the current inference JWT as a
+Bearer token; the refresh token is sent only to Portal's token endpoint in
+`x-nous-refresh-token`, never to inference.
 
-### Requests and models
+The plugin accepts only known inference paths (`/models`, `/chat/completions`,
+`/completions`, `/embeddings`) at the production Nous inference or welcome
+host. A Portal response cannot redirect Bearer tokens to an arbitrary host;
+HTTP redirects are refused. Caller-supplied credentials and magpie-internal
+headers are removed before forwarding.
 
-Requests use `@ai-sdk/openai-compatible`, not the Responses or Anthropic SDK.
-Magpie owns client-protocol conversion. The plugin accepts only `/v1/models`,
-`/v1/chat/completions`, `/v1/completions` and `/v1/embeddings` on the two known
-production inference origins. An address in a token response cannot authorize
-a new destination: only the exact HTTPS `/v1` bases on
-`inference-api.nousresearch.com` and `welcome-api.nousresearch.com` are kept;
-anything else is healed to the default production base. Redirects are refused.
-There is no arbitrary-host or insecure-TLS override.
+A 401 triggers at most one refresh and retry. Other upstream errors keep
+their status, and streaming responses pass through without buffering or
+rewriting their content.
 
-The loader returns a non-secret SDK placeholder. Each actual request obtains
-the current account, replaces the caller's Authorization header, and removes
-cookies, API keys, refresh-token headers and magpie-internal headers. A 401
-cancels that response and permits one refresh/replay, using a newer bearer
-already obtained by a concurrent caller where possible. It does not retry a
-403, 429 or 5xx or reinterpret them as a revoked account. `X-Magpie-Sign-In`
-reports `kept`, or `renewed` on a successful renewed request. Other response
-status, headers and body are retained. JSON request bytes are buffered for
-that one replay; response/SSE bytes are not buffered, parsed or rewritten.
-Caller cancellation stops its request without abandoning another caller's
-shared token renewal.
+## Models
 
-The model hook reads `/v1/models` with the account's Bearer token. It preserves
-IDs verbatim, including `vendor/model`. A valid live list replaces the
-bootstrap list, even if empty. An unreadable/malformed list is an error, not
-an empty entitlement: magpie can keep its last successful list. Known model
-metadata supplied by the host is retained; this plugin does not invent vision,
-reasoning, prices or token limits. Zero cost/limit values are the host's
-unknown-value defaults, not a claim of free usage or unlimited context.
+After sign-in, the account's live `/v1/models` list replaces the single
+bootstrap entry (`Hermes-4-70B`). Model ids are preserved, including the
+vendor prefix such as `openai/gpt-6-luna`. In magpie an exposed model is
+addressed as `nous-portal/openai/gpt-6-luna`.
 
-`Hermes-4-70B` is a bootstrap entry from the official
-[subscription-proxy examples](https://hermes-agent.nousresearch.com/docs/user-guide/features/subscription-proxy),
-not proof that a particular account can use it. It satisfies the repository's
-nonempty configuration contract before a live catalog is available.
+Magpie may initially expose only part of the catalog. To choose a model
+listed for your account and test it:
 
-The models hook receives only an auth **snapshot**, not `getAuth`. It therefore
-never refreshes or writes that snapshot over a concurrent new login. Magpie
-refreshes before calling it. In a host that does not refresh before model
-listing, an expired snapshot fails rather than being persisted: refresh via a
-normal request and retry the listing. This OpenCode lifecycle edge still needs
-runtime validation. There is no fabricated usage/balance hook; Portal billing,
-quota and additional protocol support are outside this change.
+```sh
+magpie provider refresh nous-portal
+magpie provider models nous-portal +openai/gpt-6-luna
+magpie provider test nous-portal openai/gpt-6-luna
+```
 
-## Verification
+The `provider test` command takes the upstream id (`openai/gpt-6-luna`), not
+the magpie-prefixed id. Model availability and billing depend on the account;
+a model appearing in `/models` does not guarantee access. The plugin does
+not guess model prices, context limits or vision/reasoning capabilities when
+the catalog does not provide them. A failed catalog read does not become an
+empty entitlement list.
 
-The tests use `node:test`, fake HTTP replies, an injected monotonic clock and a
-sandbox HOME. They do not reach a vendor or inspect real credentials. Fixtures
-are synthetic protocol-shaped inputs derived from the linked Hermes code;
-they are not captured successful production exchanges.
+## Not included
+
+- Nous Portal API keys (`nous` remains magpie's separate built-in preset).
+- Importing Hermes credentials or running Hermes's subscription proxy.
+- A separate ChatGPT OAuth flow, Portal billing/usage reporting or check-in.
+- An arbitrary inference URL override or cross-process token coordination.
+
+## Test
+
+Run the offline checks from the repository root with a temporary HOME:
 
 ```sh
 h=$(mktemp -d)
-HOME="$h" TZ=UTC node --test packages/nous/index.test.mjs
-HOME="$h" TZ=Pacific/Kiritimati node --test packages/nous/index.test.mjs
+HOME="$h" node --test packages/nous/index.test.mjs
+HOME="$h" bun test
 rm -rf "$h"
-
-# Repository CI commands; run with Bun installed, from the repository root:
-HOME=$(mktemp -d) bun test
 bun scripts/check.mjs
 ```
 
-Before calling this production-verified, confirm the public client's permitted
-third-party use and exercise a real independent browser login, model listing,
-nonstreaming and streaming/tool-call request, natural-expiry renewal, and a
-restart after the rotated token is saved. Test cancellation and two independently
-signed-in accounts in the sandbox as well. Do not manually redeem the same
-refresh token from a second process to test rotation. The PR records exactly
-which offline checks ran and which live/runtime checks remain unrun.
+Before publication, try the local package with magpie's isolated test script:
+
+```sh
+export MAGPIE=/absolute/path/to/magpie
+sh scripts/try.sh nous
+sh scripts/try.sh nous login nous-portal
+sh scripts/try.sh nous provider refresh nous-portal
+sh scripts/try.sh nous provider test nous-portal openai/gpt-6-luna
+```
+
+`try.sh` uses `.sandbox/nous` rather than your real magpie sign-ins. It clears
+ordinary environment variables, including proxy settings; configure a proxy
+inside the sandbox if needed. Do not use a portable Windows magpie binary
+that ignores HOME isolation. Sign-in and `provider test` contact Nous Portal;
+the latter may consume account credits. Test a model your account can use,
+and never share the sandbox's credential files.
+
+Protocol reference: Hermes Agent's
+[device flow](https://github.com/NousResearch/hermes-agent/blob/8b9ac5773ea07189f23aa9dfcdba1e59fd759c21/hermes_cli/auth_device_flow.py),
+[refresh handling](https://github.com/NousResearch/hermes-agent/blob/8b9ac5773ea07189f23aa9dfcdba1e59fd759c21/hermes_cli/auth_nous.py)
+and [Nous Portal proxy adapter](https://github.com/NousResearch/hermes-agent/blob/8b9ac5773ea07189f23aa9dfcdba1e59fd759c21/hermes_cli/proxy/adapters/nous_portal.py).
