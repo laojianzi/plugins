@@ -1,0 +1,68 @@
+diff --git a/packages/nous/index.test.mjs b/packages/nous/index.test.mjs
+index 6a0570f..960cd0c 100644
+--- a/packages/nous/index.test.mjs
++++ b/packages/nous/index.test.mjs
+@@ -350,12 +350,62 @@ test("Request bytes, tool calls, caller headers and SSE are preserved; unrelated
+     return response
+   }
+   const result = await loader.fetch(req)
+-  assert.equal(result.body, response.body)
++  // Response may wrap the stream (Bun does); identity is not its contract.
++  assert.equal(result.status, response.status)
++  assert.equal(result.headers.get("content-type"), "text/event-stream")
++  assert.equal(result.headers.get("x-upstream"), "kept")
+   assert.equal(result.headers.get("x-magpie-sign-in"), "kept")
+   assert.equal(await result.text(), sse)
+   assert.equal(req.headers.get("authorization"), "placeholder")
+ })
+ 
++test("SSE bytes arrive before upstream closes and consumer cancellation reaches upstream", { timeout: 15000 }, async () => {
++  Date.now = () => NOW
++  const s = store(saved()), hooks = await entry.NousPortalAuthPlugin({ client: s.client }), loader = await hooks.auth.loader(s.get)
++  let controller, cancelled, closed = false, reader, timer
++  const source = new ReadableStream({
++    start(c) { controller = c },
++    cancel(reason) { cancelled = reason; closed = true },
++  })
++  globalThis.fetch = async () => new Response(source, { headers: { "content-type": "text/event-stream" } })
++  // Hold the source open until its bytes have reached the consumer. The timer
++  // only detects a deadlock; no timing threshold decides whether streaming works.
++  const deadline = new Promise((_, reject) => {
++    timer = setTimeout(() => reject(new Error("SSE did not reach the consumer while upstream was still open")), 5000)
++  })
++  const pending = loader.fetch(INFERENCE + "/chat/completions", { method: "POST", body: '{"stream":true}' })
++  try {
++    const result = await Promise.race([pending, deadline])
++    assert.equal(result.headers.get("content-type"), "text/event-stream")
++    reader = result.body.getReader()
++    const bytes = Buffer.from('data: {"choices":[{"delta":{"content":"你好"}}]}\n\ndata: [DONE]\n\n')
++    const split = bytes.indexOf(Buffer.from("你")) + 1 // split a UTF-8 character, not just an SSE event
++    for (const chunk of [bytes.subarray(0, split), bytes.subarray(split)]) {
++      controller.enqueue(chunk)
++      const received = []
++      let length = 0
++      // A runtime may rechunk a stream; compare bytes, not read boundaries.
++      while (length < chunk.length) {
++        const part = await Promise.race([reader.read(), deadline])
++        assert.equal(part.done, false, "the source has not ended")
++        received.push(Buffer.from(part.value))
++        length += part.value.byteLength
++      }
++      assert.deepEqual(Buffer.concat(received), chunk)
++      assert.equal(closed, false)
++    }
++    await Promise.race([reader.cancel("consumer stopped"), deadline])
++    assert.equal(cancelled, "consumer stopped")
++  } finally {
++    clearTimeout(timer)
++    // Also releases a buffering regression, so a failing test leaves no reader
++    // or pending fetch running into the next test.
++    if (!closed) { controller.close(); closed = true }
++    if (reader) { await reader.cancel(); reader.releaseLock() }
++    await pending.catch(() => {})
++  }
++})
++
+ test("401 cancels the old response, refreshes once and replays the exact body only once", async () => {
+   Date.now = () => NOW
+   const s = store(saved()), hooks = await entry.NousPortalAuthPlugin({ client: s.client }), loader = await hooks.auth.loader(s.get)

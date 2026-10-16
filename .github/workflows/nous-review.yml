@@ -1,0 +1,109 @@
+name: Nous review verification
+
+on:
+  push:
+    branches: [verify/nous-review-163]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        bun: ['1.4.2', '1.4.3']
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ matrix.bun }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Reproduce reviewed failure and apply candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/nous-evidence"
+          h=$(mktemp -d)
+          trap 'rm -rf "$h"' EXIT
+          { git rev-parse HEAD; bun --version; node --version; } | tee "$RUNNER_TEMP/nous-evidence/versions.txt"
+          test "$(git hash-object packages/nous/index.test.mjs)" = 6a0570fb19cc586a581ff24bac7f5af9826f0722
+          set +e
+          HOME="$h" bun test packages/nous/index.test.mjs > "$RUNNER_TEMP/nous-evidence/baseline.log" 2>&1
+          result=$?
+          set -e
+          cat "$RUNNER_TEMP/nous-evidence/baseline.log"
+          test "$result" = 1
+          grep -F '41 pass' "$RUNNER_TEMP/nous-evidence/baseline.log"
+          grep -F '1 fail' "$RUNNER_TEMP/nous-evidence/baseline.log"
+          grep -F 'Request bytes, tool calls, caller headers and SSE are preserved' "$RUNNER_TEMP/nous-evidence/baseline.log"
+          git apply --check .review-163.patch
+          git apply .review-163.patch
+          test "$(git hash-object packages/nous/index.test.mjs)" = 960cd0c16b4d7b8c289cc2f1fd3bc67de3d9cee7
+          git diff --check
+      - name: Package and full repository checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          h=$(mktemp -d)
+          trap 'rm -rf "$h"' EXIT
+          HOME="$h" TZ=UTC bun test packages/nous 2>&1 | tee "$RUNNER_TEMP/nous-evidence/bun-package-utc.log"
+          HOME="$h" TZ=Pacific/Kiritimati bun test packages/nous 2>&1 | tee "$RUNNER_TEMP/nous-evidence/bun-package-plus14.log"
+          HOME="$h" TZ=UTC node --test packages/nous/index.test.mjs 2>&1 | tee "$RUNNER_TEMP/nous-evidence/node-package-utc.log"
+          HOME="$h" TZ=Pacific/Kiritimati node --test packages/nous/index.test.mjs 2>&1 | tee "$RUNNER_TEMP/nous-evidence/node-package-plus14.log"
+          HOME="$h" bun test 2>&1 | tee "$RUNNER_TEMP/nous-evidence/bun-full.log"
+          HOME="$h" bun scripts/check.mjs 2>&1 | tee "$RUNNER_TEMP/nous-evidence/hooks.log"
+          node --check packages/nous/index.mjs
+          node --check packages/nous/oauth.mjs
+          node --check packages/nous/index.test.mjs
+          (cd packages/nous && HOME="$h" npm pack --dry-run --ignore-scripts --json) > "$RUNNER_TEMP/nous-evidence/npm-pack.json"
+      - name: New stream test detects buffering
+        shell: bash
+        run: |
+          set -euo pipefail
+          h=$(mktemp -d)
+          trap 'git restore packages/nous/index.mjs; rm -rf "$h"' EXIT
+          node --input-type=module <<'JS'
+          import { readFileSync, writeFileSync } from 'node:fs';
+          const path = 'packages/nous/index.mjs';
+          const text = readFileSync(path, 'utf8');
+          const needle = 'new Response(res.body, { status: res.status';
+          if (text.split(needle).length !== 2) throw new Error('mutation target changed');
+          writeFileSync(path, text.replace(needle, 'new Response(await res.text(), { status: res.status'));
+          JS
+          node --check packages/nous/index.mjs
+          set +e
+          HOME="$h" bun test packages/nous -t 'SSE bytes arrive before upstream closes' > "$RUNNER_TEMP/nous-evidence/buffering-mutant.log" 2>&1
+          result=$?
+          set -e
+          cat "$RUNNER_TEMP/nous-evidence/buffering-mutant.log"
+          test "$result" = 1
+          grep -F 'SSE did not reach the consumer while upstream was still open' "$RUNNER_TEMP/nous-evidence/buffering-mutant.log"
+          git restore packages/nous/index.mjs
+          HOME="$h" bun test packages/nous 2>&1 | tee "$RUNNER_TEMP/nous-evidence/restored-package.log"
+      - name: Verify integration with pinned current upstream main
+        shell: bash
+        run: |
+          set -euo pipefail
+          h=$(mktemp -d)
+          trap 'rm -rf "$h"' EXIT
+          git fetch --no-tags https://github.com/magpie-community/plugins.git 2ea25b925b61ddb9440d8c8b5d943fb16bf64ee4
+          git -c user.name=Verifier -c user.email=verifier@localhost merge --no-commit --no-ff FETCH_HEAD
+          test "$(git hash-object packages/nous/index.test.mjs)" = 960cd0c16b4d7b8c289cc2f1fd3bc67de3d9cee7
+          HOME="$h" bun test 2>&1 | tee "$RUNNER_TEMP/nous-evidence/bun-integrated-full.log"
+          HOME="$h" bun scripts/check.mjs 2>&1 | tee "$RUNNER_TEMP/nous-evidence/integrated-hooks.log"
+          git diff --check
+      - name: Save evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nous-review-${{ matrix.bun }}
+          path: ${{ runner.temp }}/nous-evidence/
+          retention-days: 14
