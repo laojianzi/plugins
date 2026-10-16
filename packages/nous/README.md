@@ -5,11 +5,9 @@ Device Authorization flow and sends model requests in
 [magpie](https://usemagpie.ai) and [OpenCode](https://opencode.ai). Provider id:
 `nous-portal`. This is separate from magpie's `nous` API-key preset.
 
-**Experimental.** The plugin uses the public `hermes-cli` OAuth client id from
-Hermes Agent; Nous has not confirmed its use by independent clients. Device
-sign-in and live model discovery have been tried with a real account in magpie.
-Inference requests, token renewal after expiry, and OpenCode have not yet been
-verified with a real account.
+Device sign-in and live model discovery have been verified with a real Nous
+Portal account in magpie. Inference, renewal after expiry and OpenCode
+integration still need real-account validation.
 
 ## Signing in
 
@@ -31,8 +29,34 @@ array in `opencode.json`, then run `opencode auth login`.
 The flow uses Nous Portal's `/api/oauth/device/code` and `/api/oauth/token`
 with public client `hermes-cli`, scope `inference:invoke`, and no client
 secret. Device polling follows [RFC 8628](https://www.rfc-editor.org/rfc/rfc8628.html#section-3.5),
-including the server's interval and `slow_down` responses. The Portal decides which sign-in methods and models an
-account can use; the plugin does not implement a separate ChatGPT sign-in.
+including the server's interval and `slow_down` responses. Nous has not
+confirmed whether independent clients may use the public `hermes-cli`
+OAuth client ID.
+
+## ChatGPT plan sharing
+
+Nous Portal offers **Continue with ChatGPT** (Sign in with ChatGPT) on its
+website and supports [ChatGPT plan sharing](https://portal.nousresearch.com/help/chatgpt-plan-sharing)
+for eligible inference. A paid Nous subscription is not needed for covered
+requests. ChatGPT authentication and plan consent happen on the Portal's
+website; this plugin still signs in to Nous Portal, not directly to OpenAI.
+
+1. Sign in to [Nous Portal](https://portal.nousresearch.com/login) using
+   **Continue with ChatGPT**, or use an existing Nous Portal account.
+2. Open **Account settings → Linked accounts → ChatGPT** in Nous Portal.
+   Connect the ChatGPT account and approve **Plan sharing** on its consent
+   screen. Signing in with ChatGPT alone does not enable plan sharing.
+3. Confirm that the connection and **Plan sharing** switch are active, then
+   use `magpie plugin login nous-portal` and choose an eligible model.
+
+Sharing applies to your personal account by default. For team requests,
+enable **Use in my teams** in Linked accounts. Only eligible inference uses
+the ChatGPT plan. Other models, tools and Hermes Cloud hosting are charged
+separately by Nous, and ChatGPT plan and app limits still apply. If sharing
+is off, Nous uses its normal credit pricing; failed requests that selected
+ChatGPT sharing are not automatically retried against Nous credits. Check
+your allowance in ChatGPT. The plugin does not report ChatGPT quota or
+choose how Nous bills a request.
 
 ## Where the sign-in is kept
 
@@ -103,7 +127,8 @@ empty entitlement list.
 
 - Nous Portal API keys (`nous` remains magpie's separate built-in preset).
 - Importing Hermes credentials or running Hermes's subscription proxy.
-- A separate ChatGPT OAuth flow, Portal billing/usage reporting or check-in.
+- Direct ChatGPT/Codex OAuth, ChatGPT/Portal billing and quota reporting,
+  or daily check-in. Plan sharing is configured in Nous Portal.
 - An arbitrary inference URL override or cross-process token coordination.
 
 ## Test
@@ -134,6 +159,11 @@ inside the sandbox if needed. Do not use a portable Windows magpie binary
 that ignores HOME isolation. Sign-in and `provider test` contact Nous Portal;
 the latter may consume account credits. Test a model your account can use,
 and never share the sandbox's credential files.
+
+For a plan-sharing check, confirm the connection and consent in Nous Portal
+before sending an eligible inference request. Inspect ChatGPT's allowance and
+Nous's account activity afterward; a successful request alone does not prove
+which allowance paid for it.
 
 Protocol reference: Hermes Agent's
 [device flow](https://github.com/NousResearch/hermes-agent/blob/8b9ac5773ea07189f23aa9dfcdba1e59fd759c21/hermes_cli/auth_device_flow.py),
