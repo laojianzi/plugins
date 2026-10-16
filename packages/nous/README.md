@@ -5,10 +5,6 @@ Device Authorization flow and sends model requests in
 [magpie](https://usemagpie.ai) and [OpenCode](https://opencode.ai). Provider id:
 `nous-portal`. This is separate from magpie's `nous` API-key preset.
 
-Device sign-in and live model discovery have been verified with a real Nous
-Portal account in magpie. Inference, renewal after expiry and OpenCode
-integration still need real-account validation.
-
 ## Signing in
 
 Once the package is available from magpie's plugin registry:
