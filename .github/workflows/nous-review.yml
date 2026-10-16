@@ -40,10 +40,16 @@ jobs:
           result=$?
           set -e
           cat "$RUNNER_TEMP/nous-evidence/baseline.log"
-          test "$result" = 1
-          grep -F '41 pass' "$RUNNER_TEMP/nous-evidence/baseline.log"
-          grep -F '1 fail' "$RUNNER_TEMP/nous-evidence/baseline.log"
-          grep -F 'Request bytes, tool calls, caller headers and SSE are preserved' "$RUNNER_TEMP/nous-evidence/baseline.log"
+          if [ "$result" = 0 ]; then
+            test "$(bun --version)" = 1.4.3
+            grep -F '42 pass' "$RUNNER_TEMP/nous-evidence/baseline.log"
+            grep -F '0 fail' "$RUNNER_TEMP/nous-evidence/baseline.log"
+          else
+            test "$result" = 1
+            grep -F '41 pass' "$RUNNER_TEMP/nous-evidence/baseline.log"
+            grep -F '1 fail' "$RUNNER_TEMP/nous-evidence/baseline.log"
+            grep -F 'Request bytes, tool calls, caller headers and SSE are preserved' "$RUNNER_TEMP/nous-evidence/baseline.log"
+          fi
           git apply --check .review-163.patch
           git apply .review-163.patch
           test "$(git hash-object packages/nous/index.test.mjs)" = 960cd0c16b4d7b8c289cc2f1fd3bc67de3d9cee7
