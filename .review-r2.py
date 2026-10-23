@@ -17,8 +17,12 @@ mode = sys.argv[1]
 if mode == 'tests':
     p = Path('packages/nous/index.test.mjs')
     assert blob(p) == '960cd0c16b4d7b8c289cc2f1fd3bc67de3d9cee7'
-    p.write_text(p.read_text() + Path('.review-r2-tests.txt').read_text())
-    assert blob(p) == 'e64700dd04b8047a51e9ed93b2fceb4401cbd648'
+    s = p.read_text() + Path('.review-r2-tests.txt').read_text()
+    # Bun 1.4.2 force-stops the server in closeAllConnections; use normal close.
+    s = replace(s, '    server.closeAllConnections()\n', '')
+    s = replace(s, '"x-upstream": "native" })', '"x-upstream": "native", connection: "close" })')
+    p.write_text(s)
+    assert blob(p) == '3d503a1fba318426b72910a8582b72b6d37f3075'
 elif mode == 'fix':
     expected = {
         'packages/nous/index.mjs': 'd45ee8705f06142380af998e9a94dd75aa528712',
@@ -93,7 +97,7 @@ headers are removed because fetch may already have decoded the body.
     for path, sha in {
         'packages/nous/index.mjs': '1c4e6f0d1809c215d7486313b79fe6ca3225dcdf',
         'packages/nous/oauth.mjs': 'e3f5303d5ab03b4bab7b172167c15961dbbb7819',
-        'packages/nous/index.test.mjs': 'e64700dd04b8047a51e9ed93b2fceb4401cbd648',
+        'packages/nous/index.test.mjs': '3d503a1fba318426b72910a8582b72b6d37f3075',
     }.items():
         assert blob(path) == sha, path
     paths = sorted([*expected, 'packages/nous/index.test.mjs'])
