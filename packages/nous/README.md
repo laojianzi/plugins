@@ -29,30 +29,7 @@ including the server's interval and `slow_down` responses. Nous has not
 confirmed whether independent clients may use the public `hermes-cli`
 OAuth client ID.
 
-## ChatGPT plan sharing
-
-Nous Portal offers **Continue with ChatGPT** (Sign in with ChatGPT) on its
-website and supports [ChatGPT plan sharing](https://portal.nousresearch.com/help/chatgpt-plan-sharing)
-for eligible inference. A paid Nous subscription is not needed for covered
-requests. ChatGPT authentication and plan consent happen on the Portal's
-website; this plugin still signs in to Nous Portal, not directly to OpenAI.
-
-1. Sign in to [Nous Portal](https://portal.nousresearch.com/login) using
-   **Continue with ChatGPT**, or use an existing Nous Portal account.
-2. Open **Account settings → Linked accounts → ChatGPT** in Nous Portal.
-   Connect the ChatGPT account and approve **Plan sharing** on its consent
-   screen. Signing in with ChatGPT alone does not enable plan sharing.
-3. Confirm that the connection and **Plan sharing** switch are active, then
-   use `magpie plugin login nous-portal` and choose an eligible model.
-
-Sharing applies to your personal account by default. For team requests,
-enable **Use in my teams** in Linked accounts. Only eligible inference uses
-the ChatGPT plan. Other models, tools and Hermes Cloud hosting are charged
-separately by Nous, and ChatGPT plan and app limits still apply. If sharing
-is off, Nous uses its normal credit pricing; failed requests that selected
-ChatGPT sharing are not automatically retried against Nous credits. Check
-your allowance in ChatGPT. The plugin does not report ChatGPT quota or
-choose how Nous bills a request.
+For ChatGPT plan sharing, see [Nous Portal's documentation](https://portal.nousresearch.com/help/chatgpt-plan-sharing).
 
 ## Where the sign-in is kept
 
@@ -61,6 +38,12 @@ sign-in store. The saved OAuth fields are `access` (inference JWT), `expires`
 (epoch milliseconds) and `refresh` (versioned JSON containing the refresh
 token, scope, token type and inference endpoint). **The entire `refresh` value
 is secret**, even though it looks like JSON.
+
+Expiry uses the earlier of the token response's lifetime and the JWT's `exp`.
+If both are absent, renewal is scheduled one hour after the exchange, with
+the same two-minute lead. This is a local fallback, not a Nous lifetime
+guarantee; a 401 can still trigger renewal sooner. Explicitly expired or
+malformed lifetimes are not extended.
 
 Nothing is read from or written to `~/.hermes/auth.json`. A separate device
 sign-in is intentional: Nous refresh tokens are single-use, and copying one
@@ -75,8 +58,10 @@ that instance to reuse the old refresh token.
 
 **Do not run multiple hosts against the same saved account.** The per-request
 save is not an atomic cross-process operation; a crash during an unsaved
-rotation may require signing in again. Explicit revoked-grant errors require
-re-authentication, while temporary service or edge failures keep the sign-in.
+rotation may require signing in again. Only explicit `invalid_grant`,
+`invalid_token` or `refresh_token_reused` errors mark the grant expired.
+Other refresh refusals, including HTML or empty 401/403 responses, keep the
+credentials and allow a later retry.
 
 ## Requests
 
@@ -94,7 +79,8 @@ headers are removed before forwarding.
 
 A 401 triggers at most one refresh and retry. Other upstream errors keep
 their status, and streaming responses pass through without buffering or
-rewriting their content.
+rewriting their content. The upstream `content-encoding` and `content-length`
+headers are removed because fetch may already have decoded the body.
 
 ## Models
 
@@ -123,8 +109,7 @@ empty entitlement list.
 
 - Nous Portal API keys (`nous` remains magpie's separate built-in preset).
 - Importing Hermes credentials or running Hermes's subscription proxy.
-- Direct ChatGPT/Codex OAuth, ChatGPT/Portal billing and quota reporting,
-  or daily check-in. Plan sharing is configured in Nous Portal.
+- Direct ChatGPT/Codex OAuth, billing or quota reporting, or daily check-in.
 - An arbitrary inference URL override or cross-process token coordination.
 
 ## Test
@@ -155,11 +140,6 @@ inside the sandbox if needed. Do not use a portable Windows magpie binary
 that ignores HOME isolation. Sign-in and `provider test` contact Nous Portal;
 the latter may consume account credits. Test a model your account can use,
 and never share the sandbox's credential files.
-
-For a plan-sharing check, confirm the connection and consent in Nous Portal
-before sending an eligible inference request. Inspect ChatGPT's allowance and
-Nous's account activity afterward; a successful request alone does not prove
-which allowance paid for it.
 
 Protocol reference: Hermes Agent's
 [device flow](https://github.com/NousResearch/hermes-agent/blob/8b9ac5773ea07189f23aa9dfcdba1e59fd759c21/hermes_cli/auth_device_flow.py),

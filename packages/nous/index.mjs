@@ -65,6 +65,9 @@ export async function NousPortalAuthPlugin({ client }) {
       res = await send(a)
     }
     const headers = new Headers(res.headers)
+    // fetch decodes the body; the upstream wire encoding and size no longer apply.
+    headers.delete("content-encoding")
+    headers.delete("content-length")
     headers.set("X-Magpie-Sign-In", renewed && res.ok ? "renewed" : "kept")
     return new Response(res.body, { status: res.status, statusText: res.statusText, headers })
   }

@@ -9,6 +9,7 @@ export const WELCOME = "https://welcome-api.nousresearch.com/v1"
 export const CLIENT_ID = "hermes-cli"
 export const SCOPE = "inference:invoke"
 export const LEAD = 120000
+const FALLBACK_LIFETIME = 60 * 60 * 1000
 const GRANT = "urn:ietf:params:oauth:grant-type:device_code"
 const DEAD = new Set(["invalid_grant", "invalid_token", "refresh_token_reused"])
 const KNOWN = new Set([...DEAD, "access_denied", "expired_token", "authorization_pending", "slow_down", "invalid_client", "invalid_scope"])
@@ -87,10 +88,13 @@ function token(body, old, started) {
   const previous = old ? metadata(old) : {}
   const access = text(body?.access_token)
   const c = claims(access)
-  const expiries = [
-    positive(body?.expires_in) ? started + body.expires_in * 1000 : 0,
-    typeof c.exp === "number" && Number.isFinite(c.exp) ? Math.max(1, c.exp * 1000) : 0,
-  ].filter(positive)
+  // An absent lifetime needs a stable renewal schedule, not expires=1. An
+  // explicitly expired or malformed bound must never be replaced by that default.
+  const expiries = []
+  if (body?.expires_in !== undefined) expiries.push(typeof body.expires_in === "number" ? started + body.expires_in * 1000 : NaN)
+  if (c.exp !== undefined) expiries.push(typeof c.exp === "number" ? c.exp * 1000 : NaN)
+  let expires = started + FALLBACK_LIFETIME
+  if (expiries.length) expires = expiries.every(Number.isFinite) ? Math.max(1, Math.min(...expiries)) : 1
   const m = {
     version: 1,
     token: text(body?.refresh_token) || previous.token || "",
@@ -100,7 +104,7 @@ function token(body, old, started) {
   }
   // Keep metadata in the standard refresh field, so OpenCode stores that keep
   // only type/access/refresh/expires retain routing and the granted scope too.
-  const result = { access, refresh: JSON.stringify(m), expires: expiries.length ? Math.min(...expiries) : 1 }
+  const result = { access, refresh: JSON.stringify(m), expires }
   if (!m.token) throw new AuthError("missing_refresh_token")
   if (!usable(result, started)) result.expires = 1
   return result
@@ -114,7 +118,9 @@ function transient(r) {
 function refused(r, refreshing = false) {
   if (transient(r)) return new AuthError("temporarily_unavailable", false, r.status)
   const raw = text(r.body?.error)
-  const code = KNOWN.has(raw) ? raw : refreshing && !raw && [401, 403].includes(r.status) ? "invalid_grant" : "oauth_request_failed"
+  // A proxy or WAF can return 401/403 without the token endpoint seeing the
+  // grant. Only an explicit OAuth code is evidence that the grant is dead.
+  const code = KNOWN.has(raw) ? raw : "oauth_request_failed"
   return new AuthError(code, refreshing && DEAD.has(code), r.status)
 }
 
