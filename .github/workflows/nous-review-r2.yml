@@ -1,0 +1,197 @@
+# Isolated fork verification only; never writes the PR branch or publishes a package.
+name: Nous review round 2
+on:
+  push:
+    branches: [verify/nous-review-163-r2]
+permissions:
+  contents: read
+env:
+  BASE: e8831a8b35fb7fc5d7514533f82661543cebc390
+  UPSTREAM: 8e479f11710394d80d4729c2542de9904829ef76
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        bun: ['1.4.2', '1.4.3', latest]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ matrix.bun }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Reproduce review failures before fixing them
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/evidence"
+          { git rev-parse HEAD; bun --version; node --version; } | tee "$RUNNER_TEMP/evidence/versions.txt"
+          git ls-tree -r --name-only "$BASE" | grep -E '(^|/)(AGENTS|CLAUDE)\.md$' > "$RUNNER_TEMP/evidence/instructions.txt" || true
+          test ! -s "$RUNNER_TEMP/evidence/instructions.txt"
+          python .review-r2.py tests
+          h=$(mktemp -d)
+          trap 'rm -rf "$h"' EXIT
+          set +e
+          HOME="$h" bun test packages/nous > "$RUNNER_TEMP/evidence/baseline.log" 2>&1
+          result=$?
+          set -e
+          cat "$RUNNER_TEMP/evidence/baseline.log"
+          test "$result" = 1
+          grep -F '9 fail' "$RUNNER_TEMP/evidence/baseline.log"
+          python .review-r2.py fix | tee "$RUNNER_TEMP/evidence/blobs.json"
+          git diff --check
+      - name: Package, repository and packaging checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          h=$(mktemp -d)
+          trap 'rm -rf "$h"' EXIT
+          for zone in UTC Pacific/Kiritimati; do
+            label=${zone//\//_}
+            HOME="$h" TZ="$zone" bun test packages/nous 2>&1 | tee "$RUNNER_TEMP/evidence/bun-$label.log"
+            HOME="$h" TZ="$zone" node --test packages/nous/index.test.mjs 2>&1 | tee "$RUNNER_TEMP/evidence/node-$label.log"
+          done
+          HOME="$h" bun test 2>&1 | tee "$RUNNER_TEMP/evidence/full.log"
+          HOME="$h" bun scripts/check.mjs 2>&1 | tee "$RUNNER_TEMP/evidence/hooks.log"
+          node --check packages/nous/index.mjs
+          node --check packages/nous/oauth.mjs
+          node --check packages/nous/index.test.mjs
+          (cd packages/nous; HOME="$h" npm pack --dry-run --ignore-scripts --json) > "$RUNNER_TEMP/evidence/pack.json"
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          pack = json.loads((Path(os.environ['RUNNER_TEMP'])/'evidence/pack.json').read_text())[0]
+          assert sorted(x['path'] for x in pack['files']) == ['README.md', 'index.mjs', 'oauth.mjs', 'package.json']
+          assert not pack.get('bundled')
+          PY
+      - name: New behavior tests detect each regression
+        shell: bash
+        run: |
+          set -euo pipefail
+          h=$(mktemp -d)
+          trap 'rm -rf "$h"' EXIT
+          HOME="$h" python - <<'PY'
+          import os, subprocess
+          from pathlib import Path
+          oauth = Path('packages/nous/oauth.mjs'); entry = Path('packages/nous/index.mjs')
+          mutants = [
+            ('blocked-is-dead', oauth, 'const code = KNOWN.has(raw) ? raw : "oauth_request_failed"', 'const code = KNOWN.has(raw) ? raw : refreshing && !raw && [401, 403].includes(r.status) ? "invalid_grant" : "oauth_request_failed"'),
+            ('missing-lifetime', oauth, 'let expires = started + FALLBACK_LIFETIME', 'let expires = 1'),
+            ('wire-headers', entry, '    headers.delete("content-encoding")\n    headers.delete("content-length")\n', ''),
+            ('later-expiry', oauth, 'Math.min(...expiries)', 'Math.max(...expiries)'),
+            ('ignore-explicit-expiry', oauth, 'if (body?.expires_in !== undefined)', 'if (positive(body?.expires_in))'),
+          ]
+          evidence = Path(os.environ['RUNNER_TEMP'])/'evidence'
+          for name, path, old, new in mutants:
+              source = path.read_text()
+              assert source.count(old) == 1
+              try:
+                  path.write_text(source.replace(old, new))
+                  subprocess.run(['node', '--check', str(path)], check=True)
+                  test = subprocess.run(['bun', 'test', 'packages/nous'], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=40)
+                  (evidence/f'mutant-{name}.log').write_bytes(test.stdout)
+                  assert test.returncode == 1 and b'(fail)' in test.stdout, name
+                  print(f'{name}: detected')
+              finally:
+                  path.write_text(source)
+          PY
+          HOME="$h" bun test packages/nous 2>&1 | tee "$RUNNER_TEMP/evidence/restored.log"
+      - name: Build a clean candidate and test the latest upstream merge
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'Nous review verification'
+          git config user.email 'verification@users.noreply.github.com'
+          git read-tree "$BASE"
+          git add README.md registry.json packages/nous/README.md packages/nous/index.mjs packages/nous/oauth.mjs packages/nous/index.test.mjs
+          tree=$(git write-tree)
+          echo "$tree" > "$RUNNER_TEMP/evidence/candidate-tree.txt"
+          candidate=$(printf 'Candidate for Nous review verification\n' | git commit-tree "$tree" -p "$BASE")
+          git diff --check "$BASE" "$candidate"
+          git diff --binary "$BASE" "$candidate" > "$RUNNER_TEMP/evidence/candidate.patch"
+          git diff --name-only "$BASE" "$candidate" > "$RUNNER_TEMP/evidence/changed-files.txt"
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          got = (Path(os.environ['RUNNER_TEMP'])/'evidence/changed-files.txt').read_text().splitlines()
+          assert got == sorted(['README.md','registry.json','packages/nous/README.md','packages/nous/index.mjs','packages/nous/oauth.mjs','packages/nous/index.test.mjs'])
+          PY
+          git fetch https://github.com/magpie-community/plugins.git "$UPSTREAM"
+          git ls-tree -r --name-only "$UPSTREAM" | grep -E '(^|/)(AGENTS|CLAUDE)\.md$' > "$RUNNER_TEMP/evidence/upstream-instructions.txt" || true
+          test ! -s "$RUNNER_TEMP/evidence/upstream-instructions.txt"
+          git worktree add --detach "$RUNNER_TEMP/merged" "$candidate"
+          cd "$RUNNER_TEMP/merged"
+          git merge --no-commit --no-ff "$UPSTREAM"
+          git diff --check --cached
+          git write-tree > "$RUNNER_TEMP/evidence/integrated-tree.txt"
+          h=$(mktemp -d)
+          trap 'rm -rf "$h"' EXIT
+          HOME="$h" bun test 2>&1 | tee "$RUNNER_TEMP/evidence/integrated-full.log"
+          HOME="$h" bun scripts/check.mjs 2>&1 | tee "$RUNNER_TEMP/evidence/integrated-hooks.log"
+          git merge --abort
+      - name: Save reproducible evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nous-r2-${{ matrix.bun }}
+          path: ${{ runner.temp }}/evidence/
+          retention-days: 30
+  candidate:
+    needs: test
+    if: github.repository == 'laojianzi/plugins'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: e8831a8b35fb7fc5d7514533f82661543cebc390
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          name: nous-r2-1.4.2
+          path: ${{ runner.temp }}/verified
+      - name: Store the verified candidate on a separate branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$BASE"
+          git apply --check "$RUNNER_TEMP/verified/candidate.patch"
+          git apply --index "$RUNNER_TEMP/verified/candidate.patch"
+          test "$(git write-tree)" = "$(cat "$RUNNER_TEMP/verified/candidate-tree.txt")"
+          git diff --check --cached
+          git config user.name "$(git show -s --format=%an "$BASE")"
+          git config user.email "$(git show -s --format=%ae "$BASE")"
+          cat > "$RUNNER_TEMP/message.txt" <<EOF
+          fix(nous): address refresh, expiry and response review findings
+
+          Keep unknown 401/403 refresh refusals retryable; expire grants only
+          for explicit OAuth errors. Strip decoded response wire headers.
+          Use a one-hour schedule only when both expiry fields are absent,
+          preserving explicit expiry bounds and rotated refresh tokens.
+          Narrow marketplace copy and link to Portal's plan-sharing docs.
+
+          Add 12 regression tests, including native gzip over loopback.
+          Verify Bun 1.4.2, 1.4.3 and latest plus Node 24, both timezones,
+          whole repository, hook shapes, packaging, five mutations and
+          the merge preview with upstream $UPSTREAM.
+          Evidence: https://github.com/laojianzi/plugins/actions/runs/$GITHUB_RUN_ID
+          No live credentials or Portal requests used by this verification.
+          EOF
+          git commit -F "$RUNNER_TEMP/message.txt"
+          branch="candidate/nous-review-163-$GITHUB_RUN_ID"
+          git push origin "HEAD:refs/heads/$branch"
+          { git rev-parse HEAD; git rev-parse HEAD^{tree}; printf '%s\n' "$branch"; } | tee "$RUNNER_TEMP/verified/pushed-candidate.txt"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nous-r2-verified-candidate
+          path: ${{ runner.temp }}/verified/
+          retention-days: 30

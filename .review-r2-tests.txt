@@ -1,0 +1,205 @@
+
+// PR #163: transport failures are not evidence that a refresh grant is dead.
+const blockedReplies = [
+  ["HTML 403", () => new Response("<html>blocked old-test-refresh</html>", { status: 403, headers: { "content-type": "text/html" } })],
+  ["empty 401", () => new Response(null, { status: 401 })],
+  ["JSON without an OAuth code", () => json({}, 403)],
+  ["unknown OAuth code", () => json({ error: "proxy_denied", error_description: "old-test-refresh" }, 401)],
+  ["nested error", () => json({ error: { code: "invalid_grant" } }, 403)],
+]
+
+test("host refresh keeps unknown 401/403 refusals and retries after cooldown", async () => {
+  for (const [name, reply] of blockedReplies) {
+    const c = clock(), original = expiring(), s = store(original)
+    let calls = 0
+    const flow = createAuth(s.client, options(c, async () => ++calls === 1 ? reply() : json(payload())))
+    const kept = (e) => e.code === "oauth_request_failed" && e.signIn === "kept" && !e.message.includes("old-test-refresh")
+    await assert.rejects(flow.refresh(original), kept, name)
+    await assert.rejects(flow.refresh(original), kept, name)
+    assert.equal(calls, 1, "do not hammer a blocked endpoint")
+    assert.deepEqual(await s.get(), original)
+    c.advance(30001)
+    const got = await flow.refresh(original)
+    assert.equal(metadata(got).token, "rotated-test-refresh", name)
+    assert.equal(calls, 2, "an unknown refusal must not permanently disable refresh")
+    assert.equal(s.writes.length, 0, "the host owns persistence")
+  }
+})
+
+test("an expired account survives blocked refresh and saves a later successful rotation", async () => {
+  for (const [name, reply] of blockedReplies) {
+    const c = clock(), original = saved({ expires: NOW - 1, access: jwt({ exp: (NOW - 1) / 1000 }) }), s = store(original)
+    let calls = 0
+    const flow = createAuth(s.client, options(c, async () => ++calls === 1 ? reply() : json(payload())))
+    await assert.rejects(flow.fresh(s.get), (e) => e.signIn === "kept", name)
+    await assert.rejects(flow.fresh(s.get), (e) => e.signIn === "kept", name)
+    assert.equal(calls, 1)
+    assert.deepEqual(await s.get(), original)
+    assert.equal(s.writes.length, 0)
+    c.advance(30001)
+    assert.equal((await flow.fresh(s.get)).signIn, "renewed", name)
+    assert.equal(metadata(await s.get()).token, "rotated-test-refresh")
+    assert.equal(s.writes.length, 1)
+  }
+})
+
+test("an unknown refresh refusal keeps a valid JWT but never reuses a rejected bearer", async () => {
+  for (const [name, reply] of blockedReplies) {
+    const c = clock(), original = expiring(), s = store(original)
+    let calls = 0
+    const flow = createAuth(s.client, options(c, async () => { calls++; return reply() }))
+    assert.equal((await flow.fresh(s.get)).access, original.access, name)
+    await assert.rejects(flow.fresh(s.get, original.access), (e) => e.signIn === "kept", name)
+    assert.equal(calls, 1)
+    assert.deepEqual(await s.get(), original)
+    assert.equal(s.writes.length, 0)
+  }
+})
+
+test("explicit dead grants still expire the account on 400, 401 and 403", async () => {
+  for (const status of [400, 401, 403]) for (const error of ["invalid_grant", "invalid_token", "refresh_token_reused"]) {
+    const c = clock(), s = store(expiring())
+    let calls = 0
+    const flow = createAuth(s.client, options(c, async () => { calls++; return json({ error }, status) }))
+    await assert.rejects(flow.refresh(await s.get()), (e) => e.signIn === "expired" && e.code === error)
+    c.advance(60000)
+    await assert.rejects(flow.fresh(s.get), (e) => e.signIn === "expired" && e.code === error)
+    assert.equal(calls, 1)
+    assert.equal(s.writes.length, 0)
+  }
+})
+
+test("device login without either expiry uses a one-hour scheduling fallback", async () => {
+  const c = clock(), replies = [json(device()), json(payload({ expires_in: undefined, access_token: jwt({ exp: undefined }) }))]
+  const flow = createAuth({}, options(c, async () => replies.shift()))
+  const login = await flow.authorize(), got = await login.callback()
+  assert.equal(got.type, "success")
+  assert.equal(got.expires, c.now() + 3600000)
+  assert.equal(flow.current({ ...got, type: "oauth" }).access, got.access)
+})
+
+test("host renewal without expiry returns a stable lifetime instead of renewing every 30s", async () => {
+  const c = clock(), original = expiring()
+  let calls = 0
+  const flow = createAuth({}, options(c, async () => {
+    calls++
+    return json(payload({ expires_in: undefined, access_token: jwt({ exp: undefined }) }))
+  }))
+  const got = await flow.refresh(original)
+  assert.equal(got.expires, NOW + 3600000)
+  c.advance(31000)
+  assert.deepEqual(await flow.refresh({ ...original, ...got }), got)
+  assert.equal(calls, 1)
+})
+
+test("request renewal persists fallback expiry across reloads and honors the refresh lead", async () => {
+  const c = clock(), s = store(expiring()), spent = []
+  const request = async (_url, init) => {
+    spent.push(init.headers["x-nous-refresh-token"])
+    return json(payload({ expires_in: undefined, access_token: jwt({ exp: undefined, iat: c.now() / 1000 }), refresh_token: `rotated-${spent.length}` }))
+  }
+  const flow = createAuth(s.client, options(c, request))
+  const got = await flow.fresh(s.get)
+  assert.equal(got.expires, NOW + 3600000)
+  assert.equal(s.writes.length, 1)
+  const reloaded = createAuth(s.client, options(c, request))
+  c.advance(31000)
+  assert.equal((await reloaded.fresh(s.get)).expires, got.expires)
+  c.advance(3600000 - LEAD - 31000 - 1)
+  assert.equal((await reloaded.fresh(s.get)).expires, got.expires)
+  assert.equal(spent.length, 1)
+  c.advance(1)
+  const next = await reloaded.fresh(s.get)
+  assert.equal(next.expires, c.now() + 3600000)
+  assert.deepEqual(spent, ["old-test-refresh", "rotated-1"])
+  assert.equal(s.writes.length, 2)
+})
+
+test("known lifetimes take precedence over the fallback and use the earlier bound", async () => {
+  for (const [ttl, jwtTTL, expected] of [[900, 3600, 900], [undefined, 600, 600], [7200, 900, 900], [7200, undefined, 7200]]) {
+    const c = clock()
+    const flow = createAuth({}, options(c, async () => json(payload({ expires_in: ttl, access_token: jwt({ exp: jwtTTL === undefined ? undefined : NOW / 1000 + jwtTTL }) }))))
+    assert.equal((await flow.refresh(expiring())).expires, NOW + expected * 1000)
+  }
+})
+
+test("fallback expiry does not extend an explicitly expired or malformed lifetime", async () => {
+  const cases = [
+    ...[0, -1, null, "3600", 1e308].map(expires_in => ({ expires_in })),
+    ...[0, -1, null, "1800003600", 1e308].map(exp => ({ expires_in: undefined, access_token: jwt({ exp }) })),
+  ]
+  for (const fields of cases) {
+    const c = clock()
+    const flow = createAuth({}, options(c, async () => json(payload(fields))))
+    const got = await flow.refresh(expiring())
+    assert.equal(got.expires, 1)
+    assert.equal(metadata(got).token, "rotated-test-refresh", "a bad lifetime cannot discard an already rotated refresh token")
+    assert.throws(() => flow.current({ type: "oauth", ...got }), /unusable_inference_jwt/)
+  }
+})
+
+test("fallback expiry cannot make malformed or non-inference JWTs usable", async () => {
+  for (const fields of [
+    { access_token: "not-a-jwt" },
+    { access_token: jwt({ exp: undefined, scope: "profile" }), scope: "profile" },
+    { access_token: jwt({ exp: undefined }), token_type: "Basic" },
+  ]) {
+    const c = clock()
+    const flow = createAuth({}, options(c, async () => json(payload({ expires_in: undefined, ...fields }))))
+    const got = await flow.refresh(expiring())
+    assert.equal(got.expires, 1)
+    assert.equal(metadata(got).token, "rotated-test-refresh")
+    assert.throws(() => flow.current({ type: "oauth", ...got }), /unusable_inference_jwt/)
+  }
+})
+
+test("decoded response headers are stripped for success, errors and the final 401 replay", async () => {
+  Date.now = () => NOW
+  for (const status of [200, 401, 403, 429, 500]) {
+    const s = store(saved()), hooks = await entry.NousPortalAuthPlugin({ client: s.client }), loader = await hooks.auth.loader(s.get)
+    let calls = 0
+    const body = status === 200 ? 'data: {"text":"你好"}\n\ndata: [DONE]\n\n' : '{"error":"upstream refused"}'
+    globalThis.fetch = async (url) => {
+      if (String(url).includes("/api/oauth/token")) return json(payload({ access_token: jwt({ jti: "next" }) }))
+      calls++
+      return new Response(body, { status, headers: { "content-type": status === 200 ? "text/event-stream" : "application/json", "content-encoding": "gzip", "content-length": "999", "retry-after": "7", "x-upstream": "kept" } })
+    }
+    const res = await loader.fetch(INFERENCE + "/chat/completions", { method: "POST", body: "{}" })
+    assert.equal(res.status, status)
+    assert.equal(res.headers.has("content-encoding"), false)
+    assert.equal(res.headers.has("content-length"), false)
+    assert.equal(res.headers.get("x-upstream"), "kept")
+    assert.equal(res.headers.get("retry-after"), "7")
+    assert.equal(await res.text(), body)
+    assert.equal(calls, status === 401 ? 2 : 1)
+  }
+})
+
+test("native fetch decompression through a loopback server preserves bytes without wire headers", { timeout: 15000 }, async () => {
+  const { createServer } = await import("node:http")
+  const { gzipSync } = await import("node:zlib")
+  const body = 'data: {"choices":[{"delta":{"content":"你好"}}]}\n\ndata: [DONE]\n\n'
+  const zipped = gzipSync(Buffer.from(body))
+  const server = createServer((_req, res) => {
+    res.writeHead(200, { "content-type": "text/event-stream", "content-encoding": "gzip", "content-length": String(zipped.length), "x-upstream": "native" })
+    res.end(zipped)
+  })
+  try {
+    await new Promise((resolve, reject) => { server.once("error", reject); server.listen(0, "127.0.0.1", resolve) })
+    Date.now = () => NOW
+    const s = store(saved()), hooks = await entry.NousPortalAuthPlugin({ client: s.client }), loader = await hooks.auth.loader(s.get)
+    globalThis.fetch = async (url, init) => {
+      assert.equal(url, INFERENCE + "/chat/completions")
+      return originalFetch(`http://127.0.0.1:${server.address().port}/`, init)
+    }
+    const res = await loader.fetch(INFERENCE + "/chat/completions", { method: "POST", body: "{}" })
+    assert.equal(res.headers.get("content-type"), "text/event-stream")
+    assert.equal(res.headers.get("x-upstream"), "native")
+    assert.equal(res.headers.has("content-encoding"), false)
+    assert.equal(res.headers.has("content-length"), false)
+    assert.equal(await res.text(), body)
+  } finally {
+    server.closeAllConnections()
+    await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()))
+  }
+})
